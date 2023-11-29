@@ -249,7 +249,69 @@ class ImageTools():
                 self.database.update_obs(key, j, fitsfile, maskfile, crpix1=crpix1, crpix2=crpix2)
         
         pass
-    
+
+    def nan_region(self, 
+                   region=[1,1,1,1],
+                   types=['SCI', 'SCI_BG', 'REF', 'REF_BG'],
+                   subdir='nanregion'):
+
+        """
+        Set specific rectangular region to NaN.
+        
+        Parameters
+        ----------
+        region : Bounding pixels of the region to be set to NaN. Should be in
+            format [left, right, bottom, top]
+        types : list of str, optional
+            List of data types from which the frames shall be cropped. The
+            default is ['SCI', 'SCI_BG', 'REF', 'REF_BG'].
+        subdir : str, optional
+            Name of the directory where the data products shall be saved. The
+            default is 'cropped'.
+        
+        Returns
+        -------
+        None.
+        
+        """
+
+        if len(region) != 4:
+            raise UserWarning('Parameter "region" must either be a list of four int (left, right, bottom, top)')
+        
+        # Set output directory.
+        output_dir = os.path.join(self.database.output_dir, subdir)
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+        
+        # Loop through concatenations.
+        for i, key in enumerate(self.database.obs.keys()):
+            log.info('--> Concatenation ' + key)
+            
+            # Loop through FITS files.
+            nfitsfiles = len(self.database.obs[key])
+            for j in range(nfitsfiles):
+                
+                # Read FITS file and PSF mask.
+                fitsfile = self.database.obs[key]['FITSFILE'][j]
+                data, erro, pxdq, head_pri, head_sci, is2d, imshifts, maskoffs = ut.read_obs(fitsfile)
+                
+                # Skip file types that are not in the list of types.
+                if self.database.obs[key]['TYPE'][j] in types:
+                    
+                    # NaN region in each frame.
+                    head, tail = os.path.split(fitsfile)
+                    log.info('  --> NaNing Region: ' + tail)
+                    data[:, region[2]:region[3], region[0]:region[1]] = np.nan 
+                    erro[:, region[2]:region[3], region[0]:region[1]] = np.nan
+                
+                # Write FITS file and PSF mask.
+                fitsfile = ut.write_obs(fitsfile, output_dir, data, erro, pxdq, head_pri, head_sci, is2d, imshifts, maskoffs)
+                
+                # Update spaceKLIP database.
+                self.database.update_obs(key, j, fitsfile)
+
+        pass 
+
     def pad_frames(self,
                    npix=1,
                    cval=np.nan,
@@ -1870,7 +1932,8 @@ class ImageTools():
                      method='fourier',
                      align_algo='leastsq',
                      kwargs={},
-                     subdir='aligned'):
+                     subdir='aligned',
+                     trim=None):
         """
         Align all SCI and REF frames to the first SCI frame.
         
@@ -1887,6 +1950,9 @@ class ImageTools():
         subdir : str, optional
             Name of the directory where the data products shall be saved. The
             default is 'aligned'.
+        trim : list, optional
+            Format is [l,r,b,t], number of pixels to trim from images when 
+            calculating the alignment. Images are not actually trimmed. 
         
         Returns
         -------
@@ -1898,6 +1964,14 @@ class ImageTools():
         output_dir = os.path.join(self.database.output_dir, subdir)
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
+
+        # Check whether images are trimmed during alignment
+        if trim != None:
+            tl, tr, tb, tt = trim
+            tr = -tr #Need to set right and top to negative
+            tt = -tt 
+        else:
+            tl, tr, tb, tt = 0, None, 0, None
         
         # Loop through concatenations.
         database_temp = deepcopy(self.database.obs)
@@ -1959,7 +2033,7 @@ class ImageTools():
                             # Use header values to initiate least squares fit
                             pp = leastsq(ut.alignlsq,
                                          p0,
-                                         args=(data[k], ref_image, mask, method, kwargs))[0]
+                                         args=(data[k][tb:tt,tl:tr], ref_image[tb:tt,tl:tr], mask, method, kwargs))[0]
                         elif align_algo == 'header':
                             # Just assume the header values are correct
                             pp = p0
