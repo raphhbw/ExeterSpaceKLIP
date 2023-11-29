@@ -13,6 +13,7 @@ import pdb
 import sys
 
 import astropy.io.fits as pyfits
+import astropy.stats
 import matplotlib.pyplot as plt
 import numpy as np
 
@@ -22,8 +23,9 @@ import webbpsf_ext
 
 from copy import deepcopy
 from jwst.pipeline import Detector1Pipeline, Image2Pipeline, Coron3Pipeline
+import jwst.datamodels
 from pyklip import parallelized
-from scipy.ndimage import gaussian_filter, median_filter
+from scipy.ndimage import gaussian_filter, median_filter, fourier_shift
 from scipy.ndimage import shift as spline_shift
 from scipy.optimize import leastsq, minimize
 from skimage.registration import phase_cross_correlation
@@ -82,7 +84,53 @@ class ImageTools():
         self.database = database
         
         pass
-    
+
+    def _get_output_dir(self, subdir):
+        """Utility function to get full output dir path, and create it if needed"""
+        # Set output directory.
+        output_dir = os.path.join(self.database.output_dir, subdir)
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+        return output_dir
+
+    def _iterate_function_over_files(self, types, file_transformation_function, restrict_to=None):
+        """ Iterate some callable function over all files in a database.
+
+        This is a repetitive pattern used in many of the image processing functions, so
+        we abstract it here to reduce code repetition.
+
+        The file transformation function should take one filename as an input, perform some transformation or image processing
+        write out the file to some new path, and return the output filename.
+        Any other arguments should be provided prior to passing in the function, for instance
+        via functools.partial if necessary.
+
+        """
+
+        # Loop through concatenations.
+        for i, key in enumerate(self.database.obs.keys()):
+
+            # if we limit to only processing some concatenations, check whether this concatenation matches the pattern
+            if (restrict_to is not None) and (restrict_to not in key):
+                continue
+
+            log.info('--> Concatenation ' + key)
+
+            # Loop through FITS files.
+            nfitsfiles = len(self.database.obs[key])
+            for j in range(nfitsfiles):
+
+                # Read FITS file.
+                filename = self.database.obs[key]['FITSFILE'][j]
+
+                # Only process files of the specified types.
+                #  (skip any files with types that are not in the list of types.)
+                if self.database.obs[key]['TYPE'][j] in types:
+
+                    output_filename = file_transformation_function(filename)
+
+                    # Update spaceKLIP database.
+                    self.database.update_obs(key, j, output_filename)
+
     def remove_frames(self,
                       index=[0],
                       types=['SCI', 'SCI_BG', 'REF', 'REF_BG'],
@@ -485,6 +533,9 @@ class ImageTools():
     
     def subtract_median(self,
                         types=['SCI', 'SCI_TA', 'SCI_BG', 'REF', 'REF_TA', 'REF_BG'],
+                        method='border',
+                        sigma=3.0,
+                        borderwidth=32,
                         subdir='medsub'):
         
         """
@@ -500,17 +551,31 @@ class ImageTools():
             Name of the directory where the data products shall be saved. The
             default is 'medsub'.
         
+       None.
+        
+        method : str
+            'robust' for a robust median after masking out bright stars,
+            'sigma_clipped' for another version of robust median using astropy sigma_clipped_stats on the whole image,
+            'border' for robust median on the outer border region only, to ignore the bright stellar PSF in the center,
+            or 'simple'  for a simple np.nanmedian
+        sigma : float
+            number of standard deviations to use for the clipping limit in sigma_clipped_stats, if
+            the robust option is selected.
+        borderwidth : int
+            number of pixels to use when defining the outer border region, if the border option is selected.
+            Default is to use the outermost 32 pixels around all sides of the image.
+
         Returns
         -------
-        None.
-        
-        """
+        None, but writes out new files to subdir and updates database.
+         """
         
         # Set output directory.
         output_dir = os.path.join(self.database.output_dir, subdir)
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
         
+        log.info(f'Median subtraction using method={method}')
         # Loop through concatenations.
         for i, key in enumerate(self.database.obs.keys()):
             log.info('--> Concatenation ' + key)
@@ -537,13 +602,48 @@ class ImageTools():
                     data_temp[pxdq & 1 == 1] = np.nan
                     # else:
                     #     data_temp[pxdq & 1 == 1] = np.nan
-                    bg_med = np.nanmedian(data_temp, axis=(1, 2), keepdims=True)
-                    bg_std = robust.medabsdev(data_temp, axis=(1, 2), keepdims=True)
-                    bg_ind = data_temp > (bg_med + 5. * bg_std)  # clip bright PSFs for final calculation
-                    data_temp[bg_ind] = np.nan
-                    bg_med = np.nanmedian(data_temp, axis=(1, 2), keepdims=True)
-                    data -= bg_med
-                    log.info('  --> Median subtraction: mean of frame median = %.2f' % np.mean(bg_med))
+                    if method=='robust':
+                        # Robust median, using a method by Jens
+                        bg_med = np.nanmedian(data_temp, axis=(1, 2), keepdims=True)
+                        bg_std = robust.medabsdev(data_temp, axis=(1, 2), keepdims=True)
+                        bg_ind = data_temp > (bg_med + 5. * bg_std)  # clip bright PSFs for final calculation
+                        data_temp[bg_ind] = np.nan
+                        bg_median = np.nanmedian(data_temp, axis=(1, 2), keepdims=True)
+                    elif method == 'sigma_clipped':
+                        # Robust median using astropy.stats.sigma_clipped_stats
+                        if len(data.shape) == 2:
+                            mean, median, stddev = astropy.stats.sigma_clipped_stats(data_temp,sigma=sigma)
+                        elif len(data.shape) == 3:
+                            bg_median = np.zeros([data.shape[0], 1, 1])
+                            for iint in range(data.shape[0]):
+                                mean_i, median_i, stddev_i = astropy.stats.sigma_clipped_stats(data[iint])
+                                bg_median[iint] = median_i
+                        else:
+                            raise NotImplementedError("data must be 2d or 3d for this method")
+                    elif method=='border':
+                        # Use only the outer border region of the image, near the edges of the FOV
+                        shape = data.shape
+                        if len(shape) == 2:
+                            # only one int
+                            y, x = np.indices(shape)
+                            bordermask = (x < borderwidth) | (x > shape[1] - borderwidth) | (y < borderwidth) | ( y > shape[0] - borderwidth)
+                            mean, bg_median, stddev = astropy.stats.sigma_clipped_stats(data[bordermask])
+                        elif len(shape) == 3:
+                            # perform robust stats on border region of each int
+                            y, x = np.indices(data.shape[1:])
+                            bordermask = (x < borderwidth) | (x > shape[1] - borderwidth) | (y < borderwidth) | ( y > shape[0] - borderwidth)
+                            bg_median = np.zeros([shape[0],1,1])
+                            for iint in range(shape[0]):
+                                mean_i, median_i, stddev_i = astropy.stats.sigma_clipped_stats(data[iint][bordermask])
+                                bg_median[iint] = median_i
+                        else:
+                            raise NotImplementedError("data must be 2d or 3d for this method")
+                    else:
+                        # Plain vanilla median of the image
+                        bg_median = np.nanmedian(data_temp, axis=(1, 2), keepdims=True)
+
+                    data -= bg_median
+                    log.info('  --> Median subtraction: mean of frame median = %.2f' % np.mean(bg_median))
                 
                 # Write FITS file and PSF mask.
                 fitsfile = ut.write_obs(fitsfile, output_dir, data, erro, pxdq, head_pri, head_sci, is2d, imshifts, maskoffs)
@@ -553,18 +653,20 @@ class ImageTools():
                 self.database.update_obs(key, j, fitsfile, maskfile)
     
     def subtract_background(self,
-                            nsplit=1,
+                            nints_per_med=None,
                             subdir='bgsub'):
         """
-        Subtract the corresponding background observations from the SCI and REF
-        data in the spaceKLIP database.
+        Median subtract the corresponding background observations from the SCI and REF
+        data in the spaceKLIP database. 
         
         Parameters
         ----------
-        nsplit : int, optional
-            Number of separate groups into which the SCI/REF and BG data shall
-            be split before performing the background subtraction. The default
-            is 1.
+        nints_per_med : int
+            Number of integrations per median. For example, if you have a target
+            + background dataset with 20 integrations each and nints_per_med is
+            set to 5, a median of every 5 background images will be subtracted from
+            the corresponding 5 target images. The default is None (i.e. a median 
+            across all images).
         subdir : str, optional
             Name of the directory where the data products shall be saved. The
             default is 'bgsub'.
@@ -579,15 +681,18 @@ class ImageTools():
         output_dir = os.path.join(self.database.output_dir, subdir)
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
+
+        # Store the nints_per_med parameter
+        orig_nints_per_med = deepcopy(nints_per_med)
         
         # Loop through concatenations.
         for i, key in enumerate(self.database.obs.keys()):
             log.info('--> Concatenation ' + key)
             
-            # Find science and reference files.
-            ww_sci = np.where(self.database.obs[key]['TYPE'] == 'SCI')[0]
+            # Find science, reference, and background files.
+            ww = np.where((self.database.obs[key]['TYPE'] == 'SCI')
+                            | (self.database.obs[key]['TYPE'] == 'REF'))[0]
             ww_sci_bg = np.where(self.database.obs[key]['TYPE'] == 'SCI_BG')[0]
-            ww_ref = np.where(self.database.obs[key]['TYPE'] == 'REF')[0]
             ww_ref_bg = np.where(self.database.obs[key]['TYPE'] == 'REF_BG')[0]
             
             # Loop through science background files.
@@ -600,7 +705,15 @@ class ImageTools():
                     # Read science background file.
                     fitsfile = self.database.obs[key]['FITSFILE'][j]
                     data, erro, pxdq, head_pri, head_sci, is2d, imshifts, maskoffs = ut.read_obs(fitsfile)
-                    
+
+                    # Determine split indices
+                    nints = data.shape[0]
+                    if orig_nints_per_med == None:
+                        nints_per_med = nints
+                    indxs = np.arange(nints)
+                    split_inds = [x+1 for x in indxs if (x+1)%nints_per_med == 0 
+                                              and x < (nints-nints_per_med)]
+
                     # Compute median science background.
                     sci_bg_data += [data]
                     sci_bg_erro += [erro]
@@ -608,10 +721,10 @@ class ImageTools():
                 sci_bg_data = np.concatenate(sci_bg_data)
                 sci_bg_erro = np.concatenate(sci_bg_erro)
                 sci_bg_pxdq = np.concatenate(sci_bg_pxdq)
-                sci_bg_data_split = np.array_split(sci_bg_data, nsplit, axis=0)
-                sci_bg_erro_split = np.array_split(sci_bg_erro, nsplit, axis=0)
-                sci_bg_pxdq_split = np.array_split(sci_bg_pxdq, nsplit, axis=0)
-                for k in range(nsplit):
+                sci_bg_data_split = np.array_split(sci_bg_data, split_inds, axis=0)
+                sci_bg_erro_split = np.array_split(sci_bg_erro, split_inds, axis=0)
+                sci_bg_pxdq_split = np.array_split(sci_bg_pxdq, split_inds, axis=0)
+                for k in range(len(split_inds)+1):
                     sci_bg_data_split[k] = np.nanmedian(sci_bg_data_split[k], axis=0)
                     nsample = np.sum(np.logical_not(np.isnan(sci_bg_erro_split[k])), axis=0)
                     sci_bg_erro_split[k] = np.true_divide(np.sqrt(np.nansum(sci_bg_erro_split[k]**2, axis=0)), nsample)
@@ -629,7 +742,14 @@ class ImageTools():
                     # Read reference background file.
                     fitsfile = self.database.obs[key]['FITSFILE'][j]
                     data, erro, pxdq, head_pri, head_sci, is2d, imshifts, maskoffs = ut.read_obs(fitsfile)
-                    
+
+                    # Determine split indices
+                    nints = data.shape[0]
+                    if orig_nints_per_med == None:
+                        nints_per_med = nints
+                    indxs = np.arange(nints)
+                    split_inds = [x+1 for x in indxs if (x+1)%nints_per_med == 0 
+                                                  and x < (nints-nints_per_med)]
                     # Compute median reference background.
                     ref_bg_data += [data]
                     ref_bg_erro += [erro]
@@ -637,10 +757,10 @@ class ImageTools():
                 ref_bg_data = np.concatenate(ref_bg_data)
                 ref_bg_erro = np.concatenate(ref_bg_erro)
                 ref_bg_pxdq = np.concatenate(ref_bg_pxdq)
-                ref_bg_data_split = np.array_split(ref_bg_data, nsplit, axis=0)
-                ref_bg_erro_split = np.array_split(ref_bg_erro, nsplit, axis=0)
-                ref_bg_pxdq_split = np.array_split(ref_bg_pxdq, nsplit, axis=0)
-                for k in range(nsplit):
+                ref_bg_data_split = np.array_split(ref_bg_data, split_inds, axis=0)
+                ref_bg_erro_split = np.array_split(ref_bg_erro, split_inds, axis=0)
+                ref_bg_pxdq_split = np.array_split(ref_bg_pxdq, split_inds, axis=0)
+                for k in range(len(split_inds)+1):
                     ref_bg_data_split[k] = np.nanmedian(ref_bg_data_split[k], axis=0)
                     nsample = np.sum(np.logical_not(np.isnan(ref_bg_erro_split[k])), axis=0)
                     ref_bg_erro_split[k] = np.true_divide(np.sqrt(np.nansum(ref_bg_erro_split[k]**2, axis=0)), nsample)
@@ -652,91 +772,53 @@ class ImageTools():
             if sci_bg_data is None and ref_bg_data is None:
                 raise UserWarning('Could not find any background files')
             
-            # Loop through science and reference files.
-            for j in np.append(ww_sci, ww_ref):
-                if j in ww_sci:
-                    sci = True
-                else:
-                    sci = False
-                
+            # Loop through science and reference files. 
+            for j in ww:
                 # Read FITS file and PSF mask.
                 fitsfile = self.database.obs[key]['FITSFILE'][j]
                 data, erro, pxdq, head_pri, head_sci, is2d, imshifts, maskoffs = ut.read_obs(fitsfile)
                 maskfile = self.database.obs[key]['MASKFILE'][j]
                 mask = ut.read_msk(maskfile)
+
+                wwtype = self.database.obs[key]['TYPE'][j]
+                if wwtype == 'SCI':
+                    sci = True
+                else:
+                    sci = False
+
+                # Determine split indices
+                nints = data.shape[0]
+                if orig_nints_per_med == None:
+                        nints_per_med = nints
+                indxs = np.arange(nints)
+                split_inds = [x+1 for x in indxs if (x+1)%nints_per_med == 0 
+                                          and x < (nints-nints_per_med)]
                 
                 # Subtract background.
                 head, tail = os.path.split(fitsfile)
                 log.info('  --> Background subtraction: ' + tail)
-                if sci and sci_bg_data is not None:
-                    
-                    # test = []
-                    # for k in np.logspace(-0.5, 0.5, 100):
-                    #     temp = data[0] - k * sci_bg_data
-                    #     test += [temp]
-                    # test = np.array(test)
-                    # hdu0 = fits.PrimaryHDU(test)
-                    # hdul = fits.HDUList([hdu0])
-                    # hdul.writeto(os.path.join(output_dir, tail[:-5] + '_test.fits'), output_verify='fix', overwrite=True)
-                    # hdul.close()
-                    
-                    data_split = np.array_split(data, nsplit, axis=0)
-                    erro_split = np.array_split(erro, nsplit, axis=0)
-                    pxdq_split = np.array_split(pxdq, nsplit, axis=0)
-                    for k in range(nsplit):
+
+                data_split = np.array_split(data, split_inds, axis=0)
+                erro_split = np.array_split(erro, split_inds, axis=0)
+                pxdq_split = np.array_split(pxdq, split_inds, axis=0)
+                # For each dataset, need to decide what to use as the background and subtract
+                for k in range(len(split_inds)+1):
+                    if (sci and sci_bg_data is not None) or (not sci and ref_bg_data is None):
+                        if not sci and ref_bg_data is None:
+                            log.warning('  --> Could not find reference background, attempting to use science background')
                         data_split[k] = data_split[k] - sci_bg_data_split[k]
                         erro_split[k] = np.sqrt(erro_split[k]**2 + sci_bg_erro_split[k]**2)
                         pxdq_split[k][np.logical_not(pxdq_split[k] & 1 == 1) & (sci_bg_pxdq_split[k] != 0)] += 1
-                    data = np.concatenate(data_split, axis=0)
-                    erro = np.concatenate(erro_split, axis=0)
-                    pxdq = np.concatenate(pxdq_split, axis=0)
-                elif sci and sci_bg_data is None:
-                    log.warning('  --> Could not find science background, attempting to use reference background')
-                    data_split = np.array_split(data, nsplit, axis=0)
-                    erro_split = np.array_split(erro, nsplit, axis=0)
-                    pxdq_split = np.array_split(pxdq, nsplit, axis=0)
-                    for k in range(nsplit):
+                    elif (not sci and ref_bg_data is not None) or (sci and sci_bg_data is None):
+                        if sci and sci_bg_data is None:
+                            log.warning('  --> Could not find science background, attempting to use reference background')
                         data_split[k] = data_split[k] - ref_bg_data_split[k]
                         erro_split[k] = np.sqrt(erro_split[k]**2 + ref_bg_erro_split[k]**2)
                         pxdq_split[k][np.logical_not(pxdq_split[k] & 1 == 1) & (ref_bg_pxdq_split[k] != 0)] += 1
-                    data = np.concatenate(data_split, axis=0)
-                    erro = np.concatenate(erro_split, axis=0)
-                    pxdq = np.concatenate(pxdq_split, axis=0)
-                elif not sci and ref_bg_data is not None:
-                    
-                    # test = []
-                    # for k in np.logspace(-0.5, 0.5, 100):
-                    #     temp = data[0] - k * ref_bg_data
-                    #     test += [temp]
-                    # test = np.array(test)
-                    # hdu0 = fits.PrimaryHDU(test)
-                    # hdul = fits.HDUList([hdu0])
-                    # hdul.writeto(os.path.join(output_dir, tail[:-5] + '_test.fits'), output_verify='fix', overwrite=True)
-                    # hdul.close()
-                    
-                    data_split = np.array_split(data, nsplit, axis=0)
-                    erro_split = np.array_split(erro, nsplit, axis=0)
-                    pxdq_split = np.array_split(pxdq, nsplit, axis=0)
-                    for k in range(nsplit):
-                        data_split[k] = data_split[k] - ref_bg_data_split[k]
-                        erro_split[k] = np.sqrt(erro_split[k]**2 + ref_bg_erro_split[k]**2)
-                        pxdq_split[k][np.logical_not(pxdq_split[k] & 1 == 1) & (ref_bg_pxdq_split[k] != 0)] += 1
-                    data = np.concatenate(data_split, axis=0)
-                    erro = np.concatenate(erro_split, axis=0)
-                    pxdq = np.concatenate(pxdq_split, axis=0)
-                elif not sci and ref_bg_data is None:
-                    log.warning('  --> Could not find reference background, attempting to use science background')
-                    data_split = np.array_split(data, nsplit, axis=0)
-                    erro_split = np.array_split(erro, nsplit, axis=0)
-                    pxdq_split = np.array_split(pxdq, nsplit, axis=0)
-                    for k in range(nsplit):
-                        data_split[k] = data_split[k] - sci_bg_data_split[k]
-                        erro_split[k] = np.sqrt(erro_split[k]**2 + sci_bg_erro_split[k]**2)
-                        pxdq_split[k][np.logical_not(pxdq_split[k] & 1 == 1) & (sci_bg_pxdq_split[k] != 0)] += 1
-                    data = np.concatenate(data_split, axis=0)
-                    erro = np.concatenate(erro_split, axis=0)
-                    pxdq = np.concatenate(pxdq_split, axis=0)
-                
+                data = np.concatenate(data_split, axis=0)
+                erro = np.concatenate(erro_split, axis=0)
+                pxdq = np.concatenate(pxdq_split, axis=0)
+
                 # Write FITS file and PSF mask.
                 fitsfile = ut.write_obs(fitsfile, output_dir, data, erro, pxdq, head_pri, head_sci, is2d, imshifts, maskoffs)
                 maskfile = ut.write_msk(maskfile, mask, fitsfile)
@@ -746,6 +828,7 @@ class ImageTools():
         
         pass
     
+
     def fix_bad_pixels(self,
                        method='timemed+dqmed+medfilt',
                        bpclean_kwargs={},
@@ -754,7 +837,8 @@ class ImageTools():
                        dqmed_kwargs={},
                        medfilt_kwargs={},
                        types=['SCI', 'SCI_TA', 'SCI_BG', 'REF', 'REF_TA', 'REF_BG'],
-                       subdir='bpcleaned'):
+                       subdir='bpcleaned',
+                       restrict_to=None):
         """
         Identify and fix bad pixels.
         
@@ -827,6 +911,10 @@ class ImageTools():
         
         # Loop through concatenations.
         for i, key in enumerate(self.database.obs.keys()):
+            # if we limit to only processing some concatenations, check whether this concatenation matches the pattern
+            if (restrict_to is not None) and (restrict_to not in key):
+                continue
+
             log.info('--> Concatenation ' + key)
             
             # Loop through FITS files.
@@ -1395,7 +1483,7 @@ class ImageTools():
                 if fact_temp is None:
                     self.database.update_obs(key, j, fitsfile, maskfile, blurfwhm=np.nan)
                 else:
-                    self.database.update_obs(key, j, fitsfile, maskfile, blurfwhm=fact_temp)
+                    self.database.update_obs(key, j, fitsfile, maskfile, blurfwhm=fact_temp * np.sqrt(8. * np.log(2.)))
         
         pass
     
@@ -1778,6 +1866,7 @@ class ImageTools():
                             spectral_type='G2V',
                             date=None,
                             output_dir=None,
+                            fov_pix=65,
                             oversample=2,
                             use_coeff=False):
         """
@@ -1831,38 +1920,34 @@ class ImageTools():
         # Initialize JWST_PSF object. Use odd image size so that PSF is
         # centered in pixel center.
         log.info('  --> Recenter frames: generating WebbPSF image for absolute centering (this might take a while)')
-        INSTRUME = 'NIRCam'
         FILTER = self.database.obs[key]['FILTER'][j]
-        CORONMSK = self.database.obs[key]['CORONMSK'][j]
-        if CORONMSK.startswith('MASKA') or CORONMSK.startswith('MASKB'):
-            CORONMSK = CORONMSK[:4] + CORONMSK[5:]
-        fov_pix = 65
-        kwargs = {'oversample': oversample,
-                  'date': date,
-                  'use_coeff': use_coeff,
-                  'sp': spectrum}
-        psf = JWST_PSF(INSTRUME, FILTER, CORONMSK, fov_pix, **kwargs)
+        APERNAME = self.database.obs[key]['APERNAME'][j]
+        kwargs = {
+            'fov_pix': fov_pix,
+            'oversample': oversample,
+            'date': date,
+            'use_coeff': use_coeff,
+            'sp': spectrum
+        }
+        psf = JWST_PSF(APERNAME, FILTER, **kwargs)
         
         # Get SIAF reference pixel position.
-        apsiaf = psf.inst_on.siaf[self.database.obs[key]['APERNAME'][j]]
+        apsiaf = psf.inst_on.siaf_ap
         xsciref, ysciref = (apsiaf.XSciRef, apsiaf.YSciRef)
         
         # Generate model PSF. Apply offset between SIAF reference pixel
         # position and true mask center.
         xoff = (crpix1 + 1) - xsciref
         yoff = (crpix2 + 1) - ysciref
-        # crtel = apsiaf.sci_to_tel((crpix1 + 1) - xoff, (crpix2 + 1) - yoff)
-        # model_psf = psf.gen_psf_idl(crtel, coord_frame='tel', return_oversample=False)
-        model_psf = psf.gen_psf_idl((0, 0), coord_frame='idl', return_oversample=False)  # using this instead after discussing with Jarron
+        model_psf = psf.gen_psf_idl((0, 0), coord_frame='idl', return_oversample=False, quick=True)
         if not np.isnan(self.database.obs[key]['BLURFWHM'][j]):
             gauss_sigma = self.database.obs[key]['BLURFWHM'][j] / np.sqrt(8. * np.log(2.))
             model_psf = gaussian_filter(model_psf, gauss_sigma)
         
         # Get transmission mask.
         yi, xi = np.indices(data0.shape)
-        xtel, ytel = apsiaf.sci_to_tel(xi + 1 - xoff, yi + 1 - yoff)
-        tmask, _, _ = _transmission_map(psf.inst_on, (xtel, ytel), 'tel')
-        mask = tmask**2
+        xidl, yidl = apsiaf.sci_to_idl(xi + 1 - xoff, yi + 1 - yoff)
+        mask = psf.inst_on.gen_mask_transmission_map((xidl, yidl), 'idl')
         
         # Determine relative shift between data and model PSF. Iterate 3 times
         # to improve precision.
@@ -1879,11 +1964,12 @@ class ImageTools():
                                     npix=fov_pix)
             
             # Determine relative shift between data and model PSF.
-            yshift, xshift = phase_cross_correlation(datasub * masksub,
-                                                     model_psf * masksub,
-                                                     upsample_factor=1000,
-                                                     normalization=None,
-                                                     return_error=False)
+            shift, error, phasediff = phase_cross_correlation(datasub * masksub,
+                                                              model_psf * masksub,
+                                                              upsample_factor=1000,
+                                                              normalization=None,
+                                                              return_error=False)
+            yshift, xshift = shift
             
             # Update star position.
             xc = np.mean(xsub_indarr) + xshift
@@ -2029,6 +2115,10 @@ class ImageTools():
 
                         p0 = np.array([xshift, yshift, 1.])
                         # p0 = np.array([((crpix1 + xoffset) - (self.database.obs[key]['CRPIX1'][j] + self.database.obs[key]['XOFFSET'][j])) / self.database.obs[key]['PIXSCALE'][j], ((crpix2 + yoffset) - (self.database.obs[key]['CRPIX2'][j] + self.database.obs[key]['YOFFSET'][j])) / self.database.obs[key]['PIXSCALE'][j], 1.])
+                        # Fix for weird numerical behaviour if shifts are small
+                        # but not exactly zero.
+                        if (np.abs(xshift) < 1e-3) and (np.abs(yshift) < 1e-3):
+                            p0 = np.array([0., 0., 1.])
                         if align_algo == 'leastsq':
                             # Use header values to initiate least squares fit
                             pp = leastsq(ut.alignlsq,
@@ -2120,52 +2210,53 @@ class ImageTools():
             plt.close()
             
             # Plot reference frame alignment.
-            colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
-            f = plt.figure(figsize=(6.4, 4.8))
-            ax = plt.gca()
-            seen = []
-            reps = []
-            syms = ['o', 'v', '^', '<', '>'] * (1 + len(ww_ref) // 5)
-            add = len(ww_sci)
-            for index, j in enumerate(ww_ref):
-                this = '%.3f_%.3f' % (database_temp[key]['XOFFSET'][j], database_temp[key]['YOFFSET'][j])
-                if this not in seen:
-                    ax.scatter(shifts_all[index + add][:, 0] * self.database.obs[key]['PIXSCALE'][j] * 1000, 
-                               shifts_all[index + add][:, 1] * self.database.obs[key]['PIXSCALE'][j] * 1000, 
-                               s=5, color=colors[len(seen)], marker=syms[0], 
-                               label='dither %.0f' % (len(seen) + 1))
-                    ax.hlines((-database_temp[key]['YOFFSET'][j] + yoffset)*1000, 
-                              (-database_temp[key]['XOFFSET'][j] + xoffset)*1000 - 4., 
-                              (-database_temp[key]['XOFFSET'][j] + xoffset)*1000 + 4.,
-                              color=colors[len(seen)], lw=1)
-                    ax.vlines((-database_temp[key]['XOFFSET'][j] + xoffset)*1000, 
-                              (-database_temp[key]['YOFFSET'][j] + yoffset)*1000 - 4., 
-                              (-database_temp[key]['YOFFSET'][j] + yoffset)*1000 + 4., 
-                              color=colors[len(seen)], lw=1)
-                    seen += [this]
-                    reps += [1]
+            if len(ww_ref) > 0:
+                colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
+                f = plt.figure(figsize=(6.4, 4.8))
+                ax = plt.gca()
+                seen = []
+                reps = []
+                syms = ['o', 'v', '^', '<', '>'] * (1 + len(ww_ref) // 5)
+                add = len(ww_sci)
+                for index, j in enumerate(ww_ref):
+                    this = '%.3f_%.3f' % (database_temp[key]['XOFFSET'][j], database_temp[key]['YOFFSET'][j])
+                    if this not in seen:
+                        ax.scatter(shifts_all[index + add][:, 0] * self.database.obs[key]['PIXSCALE'][j] * 1000, 
+                                   shifts_all[index + add][:, 1] * self.database.obs[key]['PIXSCALE'][j] * 1000, 
+                                   s=5, color=colors[len(seen)], marker=syms[0], 
+                                   label='dither %.0f' % (len(seen) + 1))
+                        ax.hlines((-database_temp[key]['YOFFSET'][j] + yoffset) * 1000, 
+                                  (-database_temp[key]['XOFFSET'][j] + xoffset) * 1000 - 4., 
+                                  (-database_temp[key]['XOFFSET'][j] + xoffset) * 1000 + 4.,
+                                  color=colors[len(seen)], lw=1)
+                        ax.vlines((-database_temp[key]['XOFFSET'][j] + xoffset) * 1000, 
+                                  (-database_temp[key]['YOFFSET'][j] + yoffset) * 1000 - 4., 
+                                  (-database_temp[key]['YOFFSET'][j] + yoffset) * 1000 + 4., 
+                                  color=colors[len(seen)], lw=1)
+                        seen += [this]
+                        reps += [1]
+                    else:
+                        ww = np.where(np.array(seen) == this)[0][0]
+                        ax.scatter(shifts_all[index + add][:, 0] * self.database.obs[key]['PIXSCALE'][j] * 1000, 
+                                   shifts_all[index + add][:, 1] * self.database.obs[key]['PIXSCALE'][j] * 1000, 
+                                   s=5, color=colors[ww], marker=syms[reps[ww]])
+                        reps[ww] += 1
+                ax.set_aspect('equal')
+                xlim = ax.get_xlim()
+                ylim = ax.get_ylim()
+                xrng = xlim[1]-xlim[0]
+                yrng = ylim[1]-ylim[0]
+                if xrng > yrng:
+                    ax.set_xlim(np.mean(xlim) - xrng, np.mean(xlim) + xrng)
+                    ax.set_ylim(np.mean(ylim) - xrng, np.mean(ylim) + xrng)
                 else:
-                    ww = np.where(np.array(seen) == this)[0][0]
-                    ax.scatter(shifts_all[index + add][:, 0] * self.database.obs[key]['PIXSCALE'][j] * 1000, 
-                               shifts_all[index + add][:, 1] * self.database.obs[key]['PIXSCALE'][j] * 1000, 
-                               s=5, color=colors[ww], marker=syms[reps[ww]])
-                    reps[ww] += 1
-            ax.set_aspect('equal')
-            xlim = ax.get_xlim()
-            ylim = ax.get_ylim()
-            xrng = xlim[1]-xlim[0]
-            yrng = ylim[1]-ylim[0]
-            if xrng > yrng:
-                ax.set_xlim(np.mean(xlim) - xrng, np.mean(xlim) + xrng)
-                ax.set_ylim(np.mean(ylim) - xrng, np.mean(ylim) + xrng)
-            else:
-                ax.set_xlim(np.mean(xlim) - yrng, np.mean(xlim) + yrng)
-                ax.set_ylim(np.mean(ylim) - yrng, np.mean(ylim) + yrng)
-            ax.set_xlabel('x-shift [mas]')
-            ax.set_ylabel('y-shift [mas]')
-            ax.legend(loc='upper right', fontsize='small')
-            ax.set_title(f'Reference frame alignment\n showing {len(ww_ref)} PSF refs for {self.database.obs[key]["FILTER"][ww_ref[0]]}')
-            output_file = os.path.join(output_dir, key + '_align_ref.pdf')
-            plt.savefig(output_file)
-            log.info(f" Plot saved in {output_file}")
-            plt.close()
+                    ax.set_xlim(np.mean(xlim) - yrng, np.mean(xlim) + yrng)
+                    ax.set_ylim(np.mean(ylim) - yrng, np.mean(ylim) + yrng)
+                ax.set_xlabel('x-shift [mas]')
+                ax.set_ylabel('y-shift [mas]')
+                ax.legend(loc='upper right', fontsize='small')
+                ax.set_title(f'Reference frame alignment\n showing {len(ww_ref)} PSF refs for {self.database.obs[key]["FILTER"][ww_ref[0]]}')
+                output_file = os.path.join(output_dir, key + '_align_ref.pdf')
+                plt.savefig(output_file)
+                log.info(f" Plot saved in {output_file}")
+                plt.close()
