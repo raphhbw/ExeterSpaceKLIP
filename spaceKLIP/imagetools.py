@@ -588,138 +588,6 @@ class ImageTools():
                 # Update spaceKLIP database.
                 self.database.update_obs(key, j, fitsfile, maskfile)
     
-    def subtract_background_godoy(self,
-                                  types=['SCI', 'REF'],
-                                  subdir='bgsub'):
-
-        """
-        Subtract the corresponding background observations from the SCI and REF
-        data in the spaceKLIP database using a method developed by Nico Godoy. 
-        
-        Parameters
-        ----------
-        types : list of str
-            File types to run the subtraction over.
-
-        subdir : str, optional
-            Name of the directory where the data products shall be saved. The
-            default is 'bgsub'.
-        
-        Returns
-        -------
-        None.
-        
-        """
-
-        # Set output directory.
-        output_dir = os.path.join(self.database.output_dir, subdir)
-        if not os.path.exists(output_dir):
-            os.makedirs(output_dir)
-
-        # Loop through concatenations.
-        for i, key in enumerate(self.database.obs.keys()):
-
-            # Load in bunch of stuff
-            # Find science, reference, and background files.
-            ww_sci = np.where(self.database.obs[key]['TYPE'] == 'SCI')[0]
-            ww_ref = np.where(self.database.obs[key]['TYPE'] == 'REF')[0]
-            ww_sci_bg = np.where(self.database.obs[key]['TYPE'] == 'SCI_BG')[0]
-            ww_ref_bg = np.where(self.database.obs[key]['TYPE'] == 'REF_BG')[0]
-
-            # Loop over science and reference files
-            for typ in types:
-                if typ == 'SCI':
-                    ww, ww_bg = ww_sci, ww_sci_bg
-                elif typ == 'REF':
-                    ww, ww_bg = ww_ref, ww_ref_bg
-
-                # Gather background files.
-                if len(ww_bg) == 0:
-                    raise UserWarning('Could not find any background files.')
-                else:
-                    bg_data, bg_erro, bg_pxdq  = [], [], []
-                    for j in ww_bg:
-                        # Read  background file.
-                        fitsfile = self.database.obs[key]['FITSFILE'][j]
-                        data, erro, pxdq, head_pri, head_sci, is2d, imshifts, maskoffs = ut.read_obs(fitsfile)
-
-                        # Compute median science background.
-                        bg_data += [data]
-                        bg_erro += [erro]
-                        bg_pxdq += [pxdq]
-                    bg_data, bg_erro, bg_pxdq = np.array(bg_data), np.array(bg_erro), np.array(bg_pxdq)
-
-                    # If multiple files, take the median. Otherwise, carry on. 
-                    if bg_data.ndim == 4:
-                        bg_data = np.nanmedian(bg_data, axis=0)
-
-                # Loop over individual files
-                for j in ww:
-                    # Read FITS file.
-                    fitsfile = self.database.obs[key]['FITSFILE'][j]
-                    data, erro, pxdq, head_pri, head_sci, is2d, imshifts, maskoffs = ut.read_obs(fitsfile)
-
-                    # Subtract the background per frame
-                    data -= bg_data
-
-                    # Loop over integrations
-                    data_bg_sub = np.empty_like(data)
-                    for k in range(data.shape[0]):
-                        # Subtract median of corresponding background frame from the frame
-                        bg_submed = bg_data[k,:,:] - np.nanmedian(bg_data[k,:,:])
-                        # Do the same for the data (that's already background subtracted)
-                        data_submed = data[k,:,:] - np.nanmedian(data[k,:,:])
-
-                        # Specify sections for initial guess
-                        # sect1 = data_submed[108:118,12:62]/bg_submed[108:118,12:62]
-                        # sect2 = data_submed[93:106,152:207]/bg_submed[93:106,152:207]
-                        sect1 = data_submed[112:118,4:10]/bg_submed[112:118,4:10]
-                        sect2 = data_submed[95:101,207:212]/bg_submed[95:101,207:212]
-
-                        # Reshape into 1d arrays and concatenate
-                        s1 = sect1.reshape(1,sect1.shape[0]*sect1.shape[1])
-                        s2 = sect2.reshape(1,sect2.shape[0]*sect2.shape[1])
-                        s12 = np.concatenate((s1[0,:],s2[0,:])) 
-
-                        # Take median of concatenated array
-                        cte = np.nanmedian(s12)
-
-                        # Use filter to determine mask for estimating BG scaling
-                        # at the moment only have it working for F1140C. 
-                        filt = self.database.obs[key]['FILTER'][j]
-                        if filt not in ['F1065C', 'F1140C', 'F1550C']:
-                            raise NotImplementedError('Godoy subtraction is only supported for MIRI FQPMs at this time!')
-                        else:
-                            bgmaskbase = os.path.split(os.path.abspath(__file__))[0]
-                            bgmaskfile = os.path.join(bgmaskbase, 'resources/miri_bg_masks/godoy_mask_{}.fits'.format(filt.lower()))
-
-                        # Run minimisation function, 'res' will tell us if there is any residual 
-                        # background that wasn't removed in the initial attempt. I.e. do we
-                        # need to subtract a little bit more or less? 
-                        res = minimize(ut.bg_minimize, 
-                                       x0=cte*100,
-                                       args=(data_submed, bg_submed, bgmaskfile), 
-                                       method='L-BFGS-B', 
-                                       tol=1e-7)
-
-                        # Extract scale factor for the background from res
-                        scale = res.x/100
-
-                        # Scale the background, and now subtract this correction from the original
-                        # background subtracted data
-                        data_improved_bgsub = data_submed - bg_submed*scale
-
-                        # Subtract median of residual frame to remove any residual median offset
-                        data_bg_sub[k] = data_improved_bgsub - np.nanmedian(data_improved_bgsub)
-
-                    # Write FITS file and PSF mask.
-                    fitsfile = ut.write_obs(fitsfile, output_dir, data_bg_sub, erro, pxdq, head_pri, head_sci, is2d, imshifts, maskoffs)
-                    
-                    # Update spaceKLIP database.
-                    self.database.update_obs(key, j, fitsfile)
-        
-        pass
-
     def subtract_background(self,
                             nints_per_med=None,
                             subdir='bgsub'):
@@ -1402,7 +1270,8 @@ class ImageTools():
                                  pxdq,
                                  key,
                                  gradient_kwargs={}):
-
+        print('')
+        log.info('  --> Warning!: This routine has not been thoroughly tested and requires further development')
         # Check input.
         if 'sigma' not in gradient_kwargs.keys():
             gradient_kwargs['sigma'] = 0.5
@@ -1469,9 +1338,6 @@ class ImageTools():
                 bad_pixels=bad_pixels | bad_pixels_n
 
             image[bad_pixels] = np.nan
-
-            # plt.imshow(image_to_gradient)
-            # plt.show()
 
             # Flag DQ array
             ww[i] = ww[i] | bad_pixels
@@ -2062,6 +1928,13 @@ class ImageTools():
         center from Jarron and update the current reference pixel position to
         reflect the true mask center. Account for filter-dependent distortion.
         Might not be required for simulated data.
+
+        This step uses lookup tables of information derived from NIRCam
+        commissioning activities CAR-30 and CAR-31, by J. Leisenring and J. Girard,
+        and subsequent reanalyses using additional data from PSF SGD observations.
+
+        This information will eventually be applied as updates into the SIAF,
+        after which point this step will become not necessary.
         
         Returns
         -------
@@ -2130,6 +2003,7 @@ class ImageTools():
                         method='fourier',
                         subpix_first_sci_only=False,
                         spectral_type='G2V',
+                        shft_exp=1,
                         kwargs={},
                         subdir='recentered'):
         """
@@ -2155,6 +2029,8 @@ class ImageTools():
         spectral_type : str, optional
             Host star spectral type for the WebbPSF model used to determine the
             star position behind the coronagraphic mask. The default is 'G2V'.
+        shft_exp : float, optional
+            Take image to the given power before cross correlating for shifts, default is 1. For instance, 1/2 helps align nircam bar/narrow data (or other data with weird speckles)
         kwargs : dict, optional
             Keyword arguments for the scipy.ndimage.shift routine. The default
             is {}.
@@ -2222,6 +2098,7 @@ class ImageTools():
                                 xc, yc, xshift, yshift = self.find_nircam_centers(data0=data[k].copy(),
                                                                                   key=key,
                                                                                   j=j,
+                                                                                  shft_exp=shft_exp,
                                                                                   spectral_type=spectral_type,
                                                                                   date=head_pri['DATE-BEG'],
                                                                                   output_dir=output_dir)
@@ -2351,6 +2228,7 @@ class ImageTools():
                             key,
                             j,
                             spectral_type='G2V',
+                            shft_exp=1,
                             date=None,
                             output_dir=None,
                             fov_pix=65,
@@ -2371,6 +2249,8 @@ class ImageTools():
         spectral_type : str, optional
             Host star spectral type for the WebbPSF model used to determine the
             star position behind the coronagraphic mask. The default is 'G2V'.
+        shft_exp : float, optional
+            Take image to the given power before cross correlating for shifts, default is 1.
         date : str, optional
             Observation date in the format 'YYYY-MM-DDTHH:MM:SS.MMM'. The
             default is None.
@@ -2450,9 +2330,16 @@ class ImageTools():
                                     xycen=(xc, yc),
                                     npix=fov_pix)
             
+            if shft_exp == 1:
+                img1 = datasub* masksub
+                img2 = model_psf* masksub
+            else:
+                img1 = np.power(np.abs(datasub), shft_exp)* masksub
+                img2 = np.power(np.abs(model_psf), shft_exp) * masksub
+            
             # Determine relative shift between data and model PSF.
-            shift, error, phasediff = phase_cross_correlation(datasub * masksub,
-                                                              model_psf * masksub,
+            shift, error, phasediff = phase_cross_correlation(img1,
+                                                              img2,
                                                               upsample_factor=1000,
                                                               normalization=None)
             yshift, xshift = shift
@@ -2504,6 +2391,9 @@ class ImageTools():
     def align_frames(self,
                      method='fourier',
                      align_algo='leastsq',
+                     mask_override=None,
+                     msk_shp=8,
+                     shft_exp=1,
                      kwargs={},
                      subdir='aligned'):
         """
@@ -2516,6 +2406,12 @@ class ImageTools():
         align_algo : 'leastsq' or 'header'
             Algorithm to determine the alignment offsets. Default is 'leastsq',
             'header' assumes perfect header offsets. 
+        mask_override : str, optional
+            Mask some pixels when cross correlating for shifts
+        msk_shp : int, optional
+            Shape (height or radius) for custom mask invoked by "mask_override"
+        shft_exp : float, optional
+            Take image to the given power before cross correlating for shifts, default is 1. For instance, 1/2 helps align nircam bar/narrow data (or other data with weird speckles)
         kwargs : dict, optional
             Keyword arguments for the scipy.ndimage.shift routine. The default
             is {}.
@@ -2533,6 +2429,31 @@ class ImageTools():
         output_dir = os.path.join(self.database.output_dir, subdir)
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
+
+        # useful masks for computing shifts:
+        def create_circular_mask(h, w, center=None, radius=None):
+
+            if center is None: # use the middle of the image
+                center = (int(w/2), int(h/2))
+            if radius is None: # use the smallest distance between the center and image walls
+                radius = min(center[0], center[1], w-center[0], h-center[1])
+
+            Y, X = np.ogrid[:h, :w]
+            dist_from_center = np.sqrt((X - center[0])**2 + (Y-center[1])**2)
+
+            mask = dist_from_center <= radius
+            return mask
+
+        def create_rec_mask(h, w, center=None, z=None):
+            if center is None: # use the middle of the image
+                center = (int(w/2), int(h/2))
+            if z is None:
+                z = h//4
+
+            mask = np.zeros((h,w), dtype=bool)
+            mask[center[1]-z:center[1]+z,:] = True
+
+            return mask
         
         # Loop through concatenations.
         database_temp = deepcopy(self.database.obs)
@@ -2555,6 +2476,20 @@ class ImageTools():
                 data, erro, pxdq, head_pri, head_sci, is2d, imshifts, maskoffs = ut.read_obs(fitsfile)
                 maskfile = self.database.obs[key]['MASKFILE'][j]
                 mask = ut.read_msk(maskfile)
+                if mask_override is not None:
+                    if mask_override == 'circ':
+                        mask_circ = create_circular_mask(data[0].shape[0],data[0].shape[1], radius=msk_shp)
+                    elif mask_override == 'rec':
+                        mask_circ = create_rec_mask(data[0].shape[0],data[0].shape[1], z=msk_shp)
+                    else:
+                        raise ValueError('There are `circ` and `rec` custom masks available')
+                    mask_temp = data[0].copy()
+                    mask_temp[~mask_circ] = 1
+                    mask_temp[mask_circ] = 0
+                elif mask is None:
+                    mask_temp = np.ones_like(data[0])
+                else:
+                    mask_temp = mask
                 
                 # Align frames.
                 head, tail = os.path.split(fitsfile)
@@ -2595,10 +2530,14 @@ class ImageTools():
                         if (np.abs(xshift) < 1e-3) and (np.abs(yshift) < 1e-3):
                             p0 = np.array([0., 0., 1.])
                         if align_algo == 'leastsq':
+                            if shft_exp != 1:
+                                args = (np.power(np.abs(data[k]), shft_exp), np.power(np.abs(ref_image), shft_exp), mask_temp, method, kwargs)
+                            else:
+                                args = (data[k], ref_image, mask_temp, method, kwargs)
                             # Use header values to initiate least squares fit
                             pp = leastsq(ut.alignlsq,
                                          p0,
-                                         args=(data[k], ref_image, mask, method, kwargs))[0]
+                                         args=args)[0]
                         elif align_algo == 'header':
                             # Just assume the header values are correct
                             pp = p0
@@ -2699,23 +2638,23 @@ class ImageTools():
                     if this not in seen:
                         ax.scatter(shifts_all[index + add][:, 0] * self.database.obs[key]['PIXSCALE'][j] * 1000, 
                                    shifts_all[index + add][:, 1] * self.database.obs[key]['PIXSCALE'][j] * 1000, 
-                                   s=5, color=colors[len(seen)], marker=syms[0], 
+                                   s=5, color=colors[len(seen)%len(colors)], marker=syms[0], 
                                    label='dither %.0f' % (len(seen) + 1))
                         ax.hlines((-database_temp[key]['YOFFSET'][j] + yoffset) * 1000, 
                                   (-database_temp[key]['XOFFSET'][j] + xoffset) * 1000 - 4., 
                                   (-database_temp[key]['XOFFSET'][j] + xoffset) * 1000 + 4.,
-                                  color=colors[len(seen)], lw=1)
+                                  color=colors[len(seen)%len(colors)], lw=1)
                         ax.vlines((-database_temp[key]['XOFFSET'][j] + xoffset) * 1000, 
                                   (-database_temp[key]['YOFFSET'][j] + yoffset) * 1000 - 4., 
                                   (-database_temp[key]['YOFFSET'][j] + yoffset) * 1000 + 4., 
-                                  color=colors[len(seen)], lw=1)
+                                  color=colors[len(seen)%len(colors)], lw=1)
                         seen += [this]
                         reps += [1]
                     else:
                         ww = np.where(np.array(seen) == this)[0][0]
                         ax.scatter(shifts_all[index + add][:, 0] * self.database.obs[key]['PIXSCALE'][j] * 1000, 
                                    shifts_all[index + add][:, 1] * self.database.obs[key]['PIXSCALE'][j] * 1000, 
-                                   s=5, color=colors[ww], marker=syms[reps[ww]])
+                                   s=5, color=colors[ww%len(colors)], marker=syms[reps[ww]])
                         reps[ww] += 1
                 ax.set_aspect('equal')
                 xlim = ax.get_xlim()
@@ -2736,5 +2675,4 @@ class ImageTools():
                 plt.savefig(output_file)
                 log.info(f" Plot saved in {output_file}")
                 plt.close(fig)
-
 
